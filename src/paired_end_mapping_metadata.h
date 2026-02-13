@@ -105,7 +105,7 @@ class PairedEndMappingMetadata {
     num_second_best_mappings_ = num_second_best_mappings;
   }
 
- protected:
+ public:
   MappingMetadata mapping_metadata1_;
   MappingMetadata mapping_metadata2_;
 

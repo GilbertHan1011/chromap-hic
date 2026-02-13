@@ -112,7 +112,7 @@ class MappingMetadata {
               negative_candidates_[i].count);
   }
 
- protected:
+ public:
   inline void ReserveSpace(int reserve_size) {
     minimizers_.reserve(reserve_size);
     positive_hits_.reserve(reserve_size);
