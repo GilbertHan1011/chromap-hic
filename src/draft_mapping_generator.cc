@@ -464,7 +464,180 @@ void DraftMappingGenerator::GenerateDraftMappingsOnOneStrand(
         }
       }
 
-      int align_len = mapping_end_position + 1 - error_threshold_ - num_errors - gap_beginning;
+#ifdef CHROMAP_DEBUG
+      // Detailed debug for the problematic stitched read at the first-site
+      // candidate near chr7:19858730 (rid=56, pos~19858680 in this index).
+      {
+        const char *dbg_name = read_batch.GetSequenceNameAt(read_index);
+        if (std::string(dbg_name) ==
+                "LH00708:218:22WYCCLT4:6:1102:18911:1532" &&
+            candidate_strand == kPositive && rid == 56 &&
+            position == 19858680) {
+          std::cerr << "DEBUG SPLIT DETAIL: read=" << dbg_name
+                    << " strand=+"
+                    << " rid=" << rid
+                    << " pos=" << position
+                    << " mapping_end_position=" << mapping_end_position
+                    << " num_errors=" << num_errors
+                    << " gap_beginning=" << gap_beginning
+                    << " read_mapping_length=" << read_mapping_length
+                    << " error_threshold=" << error_threshold_ << "\n";
+        }
+      }
+#endif
+
+      int align_len = mapping_end_position + 1 - error_threshold_ - num_errors -
+                      gap_beginning;
+
+      // In stitched-read mode, if the 5'-anchored split alignment is too short
+      // or has too many errors, try a 3'-anchored alignment to discover the
+      // ligation junction and then realign from that split site on the 5' side.
+      if (split_alignment_ && stitched_read_mode_ &&
+          candidate_strand == kPositive &&
+          (align_len < mapping_length_threshold ||
+           num_errors > error_threshold_ || mapping_end_position < 0)) {
+        int mapping_end_position3 = 0;
+        int read_mapping_length3 = 0;
+        int num_errors3 = BandedAlignPatternToTextWithDropOffFrom3End(
+            error_threshold_,
+            reference.GetSequenceAt(rid) + position - error_threshold_, read,
+            read_length, &mapping_end_position3, &read_mapping_length3);
+
+#ifdef CHROMAP_DEBUG
+        {
+          const char *dbg_name = read_batch.GetSequenceNameAt(read_index);
+          if (std::string(dbg_name) ==
+                  "LH00708:218:22WYCCLT4:6:1102:18911:1532" &&
+              rid == 56 && position == 19858680) {
+            std::cerr << "DEBUG 3P SEARCH: read=" << dbg_name
+                      << " rid=" << rid << " pos=" << position
+                      << " num_errors3=" << num_errors3
+                      << " mapping_end_position3=" << mapping_end_position3
+                      << " read_mapping_length3=" << read_mapping_length3
+                      << " align_len5p=" << align_len
+                      << " num_errors5p=" << num_errors << "\n";
+          }
+        }
+#endif
+
+        // For stitched Hi-C, treat the 3'-anchored alignment as a "hint":
+        // accept long suffixes even if their absolute num_errors exceeds the
+        // global error_threshold_, as long as the error *rate* is small.
+        double error_rate3 = (read_mapping_length3 > 0)
+                                 ? static_cast<double>(num_errors3) /
+                                       static_cast<double>(read_mapping_length3)
+                                 : 1.0;
+        const double max_error_rate3 = 0.08;  // allow up to 8% errors for suffix
+
+        if (mapping_end_position3 >= 0 &&
+            read_mapping_length3 >= mapping_length_threshold &&
+            read_mapping_length3 < (int)read_length &&
+            error_rate3 <= max_error_rate3) {
+          // Derive the split site on the read from the 3'-anchored suffix
+          // length, e.g., L_read - L_suffix.
+          int discovered_split = read_length - read_mapping_length3;
+
+          if (discovered_split > 0 && discovered_split < (int)read_length) {
+            // Adaptive "walk-back" safety buffer: try to avoid the noisy
+            // junction region that the 3'-anchored alignment may have
+            // over-extended into. Use ~5% of read length, capped at 15 bp.
+            const int max_safety_bp = 15;
+            int safety_buffer =
+                std::min(max_safety_bp, static_cast<int>(read_length * 0.05));
+
+            // Ensure we do not trim away almost the entire suffix.
+            if (read_length - discovered_split - safety_buffer <
+                mapping_length_threshold) {
+              safety_buffer = 0;
+            }
+
+            auto try_rescue_from =
+                [&](int extra_shift, int &out_num_errors,
+                    int &out_mapping_end_position,
+                    int &out_read_mapping_length) -> bool {
+              int mapping_end_position_resc = 0;
+              int read_mapping_length_resc = 0;
+              int num_errors_resc = BandedAlignPatternToTextWithDropOff(
+                  error_threshold_,
+                  reference.GetSequenceAt(rid) + position - error_threshold_ +
+                      discovered_split + extra_shift,
+                  read + discovered_split + extra_shift,
+                  read_length - discovered_split - extra_shift,
+                  &mapping_end_position_resc, &read_mapping_length_resc);
+
+              double error_rate_resc =
+                  (read_mapping_length_resc > 0)
+                      ? static_cast<double>(num_errors_resc) /
+                            static_cast<double>(read_mapping_length_resc)
+                      : 1.0;
+              bool resc_strict_ok = (num_errors_resc <= error_threshold_);
+              bool resc_long_ok = (read_mapping_length_resc > 50 &&
+                                   error_rate_resc <= 0.08);
+
+              if ((resc_strict_ok || resc_long_ok) &&
+                  mapping_end_position_resc >= 0) {
+                out_num_errors = num_errors_resc;
+                out_mapping_end_position = mapping_end_position_resc;
+                out_read_mapping_length = read_mapping_length_resc;
+                return true;
+              }
+              return false;
+            };
+
+            int chosen_shift = -1;
+            int chosen_num_errors = 0;
+            int chosen_mapping_end_position = 0;
+            int chosen_read_mapping_length = 0;
+
+            // First, try from discovered_split + safety_buffer (conservative).
+            if (try_rescue_from(safety_buffer, chosen_num_errors,
+                                chosen_mapping_end_position,
+                                chosen_read_mapping_length)) {
+              chosen_shift = safety_buffer;
+            } else {
+              // Fallback: try from discovered_split itself (no buffer) in case
+              // the 3' alignment did not actually overrun into noisy bases.
+              if (try_rescue_from(0, chosen_num_errors,
+                                  chosen_mapping_end_position,
+                                  chosen_read_mapping_length)) {
+                chosen_shift = 0;
+              }
+            }
+
+            if (chosen_shift >= 0) {
+#ifdef CHROMAP_DEBUG
+              {
+                const char *dbg_name = read_batch.GetSequenceNameAt(read_index);
+                if (std::string(dbg_name) ==
+                        "LH00708:218:22WYCCLT4:6:1102:18911:1532" &&
+                    rid == 56 && position == 19858680) {
+                  std::cerr << "DEBUG 3P RESCUE OK: read=" << dbg_name
+                            << " rid=" << rid << " pos=" << position
+                            << " discovered_split=" << discovered_split
+                            << " safety_buffer=" << safety_buffer
+                            << " chosen_shift=" << chosen_shift
+                            << " num_errors_resc=" << chosen_num_errors
+                            << " mapping_end_position_resc="
+                            << chosen_mapping_end_position
+                            << " read_mapping_length_resc="
+                            << chosen_read_mapping_length << "\n";
+                }
+              }
+#endif
+              // Successful rescue: update alignment statistics to reflect a
+              // 5'-anchored alignment starting at the adjusted split site.
+              gap_beginning = discovered_split + chosen_shift;
+              mapping_end_position =
+                  chosen_mapping_end_position + gap_beginning;
+              read_mapping_length =
+                  chosen_read_mapping_length + gap_beginning;
+              num_errors = chosen_num_errors;
+              align_len = mapping_end_position + 1 - error_threshold_ -
+                          num_errors - gap_beginning;
+            }
+          }
+        }
+      }
 
       if (align_len >= mapping_length_threshold) {
         actual_num_errors = num_errors;
@@ -481,11 +654,32 @@ void DraftMappingGenerator::GenerateDraftMappingsOnOneStrand(
                                       negative_read.data(), read_length);
           }
         }
-      } else if (stitched_read_mode_ && align_len >= 20) {
-        // Rescue partial alignment for stitched mode
-        actual_num_errors = num_errors;
-        num_errors = -align_len;  // Encode length as negative error
       } else {
+#ifdef CHROMAP_DEBUG
+        // Compact, throttled logging of discarded split segments.
+        static thread_local int last_read_index = -1;
+        static thread_local int discard_count_for_read = 0;
+        if ((int)read_index != last_read_index) {
+          // New read: reset counter and print a header.
+          last_read_index = read_index;
+          discard_count_for_read = 0;
+          std::cerr << "DEBUG DISCARD SPLIT SUMMARY: read_index=" << read_index
+                    << " name=" << read_batch.GetSequenceNameAt(read_index)
+                    << " (logging up to 20 discarded splits)\n";
+        }
+        if (discard_count_for_read < 20) {
+          std::cerr << "  split#" << discard_count_for_read
+                    << " strand=" << (candidate_strand == kPositive ? '+' : '-')
+                    << " rid=" << rid
+                    << " pos=" << position
+                    << " align_len=" << align_len
+                    << " < min_len=" << mapping_length_threshold << "\n";
+        }
+        ++discard_count_for_read;
+#endif
+        // In both normal and stitched modes, discard alignments shorter than
+        // mapping_length_threshold. This avoids rescuing very short fragments
+        // that are highly ambiguous and can dominate candidate ranking.
         num_errors = error_threshold_ + 1;
         actual_num_errors = error_threshold_ + 1;
       }

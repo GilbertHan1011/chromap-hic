@@ -506,6 +506,13 @@ void CandidateProcessor::FilterDanglingCandidatesForSingleEnd(
                          (pos_position - neg_position) :
                          (neg_position - pos_position);
       if (distance <= dangling_threshold) {
+#ifdef CHROMAP_DEBUG
+        std::cerr << "DEBUG FILTER SE: removing dangling positive cand "
+                  << "pos_rid=" << pos_rid << " pos_pos=" << pos_position
+                  << " neg_rid=" << neg_rid << " neg_pos=" << neg_position
+                  << " dist=" << distance
+                  << " thr=" << dangling_threshold << "\n";
+#endif
         is_dangling = true;
         break;
       }
@@ -532,6 +539,13 @@ void CandidateProcessor::FilterDanglingCandidatesForSingleEnd(
                          (pos_position - neg_position) :
                          (neg_position - pos_position);
       if (distance <= dangling_threshold) {
+#ifdef CHROMAP_DEBUG
+        std::cerr << "DEBUG FILTER SE: removing dangling negative cand "
+                  << "neg_rid=" << neg_rid << " neg_pos=" << neg_position
+                  << " pos_rid=" << pos_rid << " pos_pos=" << pos_position
+                  << " dist=" << distance
+                  << " thr=" << dangling_threshold << "\n";
+#endif
         is_dangling = true;
         break;
       }

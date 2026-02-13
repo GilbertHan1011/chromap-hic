@@ -1,6 +1,7 @@
 #include "minimizer_generator.h"
 
 #include "utils.h"
+#include <string>
 
 namespace chromap {
 
@@ -136,6 +137,20 @@ void MinimizerGenerator::GenerateMinimizers(
   if (min_seed.first != UINT64_MAX) {
     minimizers.emplace_back(min_seed);
   }
+
+#ifdef CHROMAP_DEBUG
+  // Debug seeding for a specific stitched read.
+  const char *read_name =
+      sequence_batch.GetSequenceNameAt(sequence_index);
+  if (std::string(read_name) ==
+      "LH00708:218:22WYCCLT4:6:1102:18911:1532") {
+    std::cerr << "DEBUG SEED: read=" << read_name
+              << " len=" << sequence_length
+              << " k=" << kmer_size_
+              << " w=" << window_size_
+              << " num_minimizers=" << minimizers.size() << "\n";
+  }
+#endif
 }
 
 }  // namespace chromap

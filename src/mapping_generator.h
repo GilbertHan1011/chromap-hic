@@ -516,8 +516,27 @@ void MappingGenerator<MappingRecord>::
             mappings1[i1].GetNumErrors(), mappings2[current_i2].GetNumErrors());
 #endif
 
-        int current_sum_errors =
-            mappings1[i1].GetNumErrors() + mappings2[current_i2].GetNumErrors();
+        int err1 = mappings1[i1].GetNumErrors();
+        int err2 = mappings2[current_i2].GetNumErrors();
+        int current_sum_errors = err1 + err2;
+#ifdef CHROMAP_DEBUG
+        bool is_cis =
+            mappings1[i1].GetReferenceSequenceIndex() ==
+            mappings2[current_i2].GetReferenceSequenceIndex();
+        uint32_t pos1 = mappings1[i1].GetReferenceSequencePosition();
+        uint32_t pos2 = mappings2[current_i2].GetReferenceSequencePosition();
+        uint32_t dist = (pos1 > pos2) ? (pos1 - pos2) : (pos2 - pos1);
+        std::cerr << "DEBUG PE PAIR CHECK: "
+                  << "i1=" << i1 << " rid1=" << mappings1[i1].GetReferenceSequenceIndex()
+                  << " pos1=" << pos1
+                  << " i2=" << current_i2
+                  << " rid2=" << mappings2[current_i2].GetReferenceSequenceIndex()
+                  << " pos2=" << pos2
+                  << " err1=" << err1 << " err2=" << err2
+                  << " sum_err=" << current_sum_errors
+                  << " dist=" << dist
+                  << (is_cis ? " [CIS]" : " [TRANS]") << "\n";
+#endif
         if (current_sum_errors < min_sum_errors) {
           second_min_sum_errors = min_sum_errors;
           num_second_best_mappings = num_best_mappings;
@@ -623,6 +642,31 @@ void MappingGenerator<MappingRecord>::
     const uint32_t i2 = best_mappings[mi].second;
     const int current_sum_errors =
         mappings1[i1].GetNumErrors() + mappings2[i2].GetNumErrors();
+
+#ifdef CHROMAP_DEBUG
+    // Debug relative positions of the two ends along their reads (split sites).
+    int gap1 = 0, len1 = 0, err1_actual = 0;
+    int gap2 = 0, len2 = 0, err2_actual = 0;
+    auto decode_split = [](int split_site, int &gap, int &len, int &act_err) {
+      len = split_site & 0xffff;
+      gap = (split_site >> 16) & 0xff;
+      act_err = (split_site >> 24) & 0xff;
+    };
+    if (mapping_parameters_.split_alignment &&
+        i1 < split_sites1.size() && i2 < split_sites2.size()) {
+      decode_split(split_sites1[i1], gap1, len1, err1_actual);
+      decode_split(split_sites2[i2], gap2, len2, err2_actual);
+      int read_dist = std::abs(gap1 - gap2);
+      std::cerr << "DEBUG SPLIT COORDS: pair_index=" << pair_index
+                << " first_gap=" << gap1 << " second_gap=" << gap2
+                << " read_dist=" << read_dist;
+      if (read_dist < 20) {
+        std::cerr << " [FAIL: COLLISION]\n";
+      } else {
+        std::cerr << " [PASS]\n";
+      }
+    }
+#endif
 
     if (current_sum_errors > paired_end_mapping_metadata.min_sum_errors_) {
       continue;
@@ -1254,8 +1298,12 @@ template <>
 void MappingGenerator<PairsMapping>::EmplaceBackPairedEndMappingRecord(
     PairedEndMappingInMemory &paired_end_mapping_in_memory,
     std::vector<std::vector<PairsMapping>> &mappings_on_diff_ref_seqs);
-
-// Template specialization for PairsMapping in stitched mode
+// Template specialization for PairsMapping in stitched single-end mode.
+// Instead of forcing one positive- and one negative-strand mapping, we:
+//  - collect all single-end mappings (both strands),
+//  - keep those within error_threshold,
+//  - pick the two best (lowest-error) mappings as the two "cores",
+//  - and build a pseudo paired-end record from them.
 template <>
 inline void MappingGenerator<PairsMapping>::GenerateBestMappingsForSingleEndRead(
     const SequenceBatch &read_batch, uint32_t read_index,
@@ -1263,82 +1311,98 @@ inline void MappingGenerator<PairsMapping>::GenerateBestMappingsForSingleEndRead
     MappingMetadata &mapping_metadata,
     std::vector<std::vector<PairsMapping>> &mappings_on_diff_ref_seqs) {
 
+  // This specialization is only meaningful in stitched mode.
   if (!mapping_parameters_.stitched_read_mode) {
-    // Should not reach here - PAIRS format requires stitched mode for single-end
     return;
   }
 
-  // Find best positive and negative mappings
+  const auto &pos_maps = mapping_metadata.positive_mappings_;
+  const auto &neg_maps = mapping_metadata.negative_mappings_;
+
+  // Find the best positive and best negative mappings separately
   int best_pos_idx = -1, best_neg_idx = -1;
   int min_pos_err = 255, min_neg_err = 255;
 
-  const auto& pos_maps = mapping_metadata.positive_mappings_;
   for (size_t i = 0; i < pos_maps.size(); ++i) {
-    if (pos_maps[i].GetNumErrors() <= mapping_parameters_.error_threshold &&
-        pos_maps[i].GetNumErrors() < min_pos_err) {
-      min_pos_err = pos_maps[i].GetNumErrors();
+    int err = pos_maps[i].GetNumErrors();
+    if (err < min_pos_err) {
+      min_pos_err = err;
       best_pos_idx = i;
     }
   }
 
-  const auto& neg_maps = mapping_metadata.negative_mappings_;
   for (size_t i = 0; i < neg_maps.size(); ++i) {
-    if (neg_maps[i].GetNumErrors() <= mapping_parameters_.error_threshold &&
-        neg_maps[i].GetNumErrors() < min_neg_err) {
-      min_neg_err = neg_maps[i].GetNumErrors();
+    int err = neg_maps[i].GetNumErrors();
+    if (err < min_neg_err) {
+      min_neg_err = err;
       best_neg_idx = i;
     }
   }
 
-  // Only create PAIRS record if we have both ends
+  // Need both a positive and negative mapping to form a pair
   if (best_pos_idx == -1 || best_neg_idx == -1) {
     return;
   }
 
-  // Create PairedEndMappingInMemory from the two single-end mappings
+  struct CoreCandidate {
+    bool is_positive;
+    int index;
+    int num_errors;
+  };
+
+  const CoreCandidate core1{/*is_positive=*/true, /*index=*/best_pos_idx, /*num_errors=*/min_pos_err};
+  const CoreCandidate core2{/*is_positive=*/false, /*index=*/best_neg_idx, /*num_errors=*/min_neg_err};
+
   PairedEndMappingInMemory paired_mapping;
 
   const char *read = read_batch.GetSequenceAt(read_index);
   const uint32_t read_length = read_batch.GetSequenceLengthAt(read_index);
-  const std::string &negative_read = read_batch.GetNegativeSequenceAt(read_index);
+  const std::string &negative_read =
+      read_batch.GetNegativeSequenceAt(read_index);
 
-  // Get split sites if available
-  const auto& pos_split_sites = mapping_metadata.positive_split_sites_;
-  const auto& neg_split_sites = mapping_metadata.negative_split_sites_;
+  const auto &pos_split_sites = mapping_metadata.positive_split_sites_;
+  const auto &neg_split_sites = mapping_metadata.negative_split_sites_;
 
-  // Setup mapping 1 (5' end - positive strand)
-  const DraftMapping& pos_mapping = pos_maps[best_pos_idx];
-  paired_mapping.mapping_in_memory1.read_id = read_batch.GetSequenceIdAt(read_index);
-  paired_mapping.mapping_in_memory1.read_name = read_batch.GetSequenceNameAt(read_index);
-  paired_mapping.mapping_in_memory1.strand = kPositive;
-  paired_mapping.mapping_in_memory1.rid = pos_mapping.GetReferenceSequenceIndex();
-  paired_mapping.mapping_in_memory1.read_sequence = read;
-  paired_mapping.mapping_in_memory1.read_length = read_length;
+#ifdef CHROMAP_DEBUG
+  // Debug stitched single-end cores: show chosen best pos/neg mappings.
+  std::cerr << "DEBUG STITCHED SE CORES read_index=" << read_index
+            << " name=" << read_batch.GetSequenceNameAt(read_index) << "\n";
+  std::cerr << "  pos_maps=" << pos_maps.size()
+            << " neg_maps=" << neg_maps.size()
+            << " best_pos_idx=" << best_pos_idx << " err=" << min_pos_err
+            << " best_neg_idx=" << best_neg_idx << " err=" << min_neg_err
+            << "\n";
+#endif
 
-  if (mapping_parameters_.split_alignment && best_pos_idx < pos_split_sites.size()) {
-    paired_mapping.mapping_in_memory1.read_split_site = pos_split_sites[best_pos_idx];
-  }
+  auto setup_core = [&](bool first, const CoreCandidate &core) {
+    MappingInMemory &m = first ? paired_mapping.mapping_in_memory1
+                               : paired_mapping.mapping_in_memory2;
 
-  GetRefStartEndPositionForReadFromMapping(
-      pos_mapping, reference, paired_mapping.mapping_in_memory1);
+    const DraftMapping &dm =
+        core.is_positive ? pos_maps[core.index] : neg_maps[core.index];
+    const auto &split_sites =
+        core.is_positive ? pos_split_sites : neg_split_sites;
 
-  // Setup mapping 2 (3' end - negative strand)
-  const DraftMapping& neg_mapping = neg_maps[best_neg_idx];
-  paired_mapping.mapping_in_memory2.read_id = read_batch.GetSequenceIdAt(read_index);
-  paired_mapping.mapping_in_memory2.read_name = read_batch.GetSequenceNameAt(read_index);
-  paired_mapping.mapping_in_memory2.strand = kNegative;
-  paired_mapping.mapping_in_memory2.rid = neg_mapping.GetReferenceSequenceIndex();
-  paired_mapping.mapping_in_memory2.read_sequence = negative_read.data();
-  paired_mapping.mapping_in_memory2.read_length = read_length;
+    m.read_id = read_batch.GetSequenceIdAt(read_index);
+    m.read_name = read_batch.GetSequenceNameAt(read_index);
+    m.strand = core.is_positive ? kPositive : kNegative;
+    m.rid = dm.GetReferenceSequenceIndex();
+    m.read_length = read_length;
+    m.read_sequence = core.is_positive ? read : negative_read.data();
 
-  if (mapping_parameters_.split_alignment && best_neg_idx < neg_split_sites.size()) {
-    paired_mapping.mapping_in_memory2.read_split_site = neg_split_sites[best_neg_idx];
-  }
+    if (mapping_parameters_.split_alignment &&
+        core.index >= 0 &&
+        static_cast<size_t>(core.index) < split_sites.size()) {
+      m.read_split_site = split_sites[core.index];
+    }
 
-  GetRefStartEndPositionForReadFromMapping(
-      neg_mapping, reference, paired_mapping.mapping_in_memory2);
+    GetRefStartEndPositionForReadFromMapping(dm, reference, m);
+  };
 
-  // Set barcode if needed
+  setup_core(/*first=*/true, core1);
+  setup_core(/*first=*/false, core2);
+
+  // Set barcode if needed.
   uint64_t barcode_key = 0;
   if (!mapping_parameters_.is_bulk_data) {
     barcode_key = barcode_batch.GenerateSeedFromSequenceAt(
@@ -1347,11 +1411,10 @@ inline void MappingGenerator<PairsMapping>::GenerateBestMappingsForSingleEndRead
   paired_mapping.mapping_in_memory1.barcode_key = barcode_key;
   paired_mapping.mapping_in_memory2.barcode_key = barcode_key;
 
-  // Calculate MAPQ - use simplified version for stitched mode
-  paired_mapping.mapq = 30;  // Default MAPQ for stitched mode
+  // Simplified MAPQ / uniqueness for stitched mode.
+  paired_mapping.mapq = 30;
   paired_mapping.is_unique = (mapping_metadata.num_best_mappings_ == 1);
 
-  // Create the PAIRS record
   EmplaceBackPairedEndMappingRecord(paired_mapping, mappings_on_diff_ref_seqs);
 }
 

@@ -430,6 +430,47 @@ void Chromap::MapSingleEndReads() {
                 candidate_processor.GenerateCandidates(
                     mapping_parameters_.error_threshold, index,
                     mapping_metadata);
+#ifdef CHROMAP_DEBUG
+                const char *dbg_read_name =
+                    read_batch.GetSequenceNameAt(read_index);
+                if (std::string(dbg_read_name) ==
+                    "LH00708:218:22WYCCLT4:6:1102:18911:1532") {
+                  std::cerr << "DEBUG CAND: read=" << dbg_read_name
+                            << " num_minimizers="
+                            << mapping_metadata.minimizers_.size()
+                            << " pos_hits="
+                            << mapping_metadata.positive_hits_.size()
+                            << " neg_hits="
+                            << mapping_metadata.negative_hits_.size()
+                            << " pos_cands="
+                            << mapping_metadata.positive_candidates_.size()
+                            << " neg_cands="
+                            << mapping_metadata.negative_candidates_.size()
+                            << "\n";
+                  auto dbg_print_cand = [](const char *label,
+                                           const Candidate &c) {
+                    std::cerr << "  " << label
+                              << " rid=" << c.GetReferenceSequenceIndex()
+                              << " pos=" << c.GetReferenceSequencePosition()
+                              << " count=" << c.count << "\n";
+                  };
+                  size_t max_show = 10;
+                  for (size_t i = 0;
+                       i < mapping_metadata.positive_candidates_.size() &&
+                       i < max_show;
+                       ++i) {
+                    dbg_print_cand("pos",
+                                   mapping_metadata.positive_candidates_[i]);
+                  }
+                  for (size_t i = 0;
+                       i < mapping_metadata.negative_candidates_.size() &&
+                       i < max_show;
+                       ++i) {
+                    dbg_print_cand("neg",
+                                   mapping_metadata.negative_candidates_[i]);
+                  }
+                }
+#endif
               }
 
               // Apply stitched mode filter if enabled
@@ -457,6 +498,42 @@ void Chromap::MapSingleEndReads() {
                 thread_num_candidates += current_num_candidates;
                 draft_mapping_generator.GenerateDraftMappings(
                     read_batch, read_index, reference, mapping_metadata);
+#ifdef CHROMAP_DEBUG
+                const char *dbg_read_name =
+                    read_batch.GetSequenceNameAt(read_index);
+                if (std::string(dbg_read_name) ==
+                    "LH00708:218:22WYCCLT4:6:1102:18911:1532") {
+                  std::cerr << "DEBUG DRAFT: read=" << dbg_read_name
+                            << " pos_maps="
+                            << mapping_metadata.positive_mappings_.size()
+                            << " neg_maps="
+                            << mapping_metadata.negative_mappings_.size()
+                            << "\n";
+                  auto dbg_print_map = [](const char *label,
+                                          const DraftMapping &dm) {
+                    std::cerr << "  " << label
+                              << " rid=" << dm.GetReferenceSequenceIndex()
+                              << " ref_pos="
+                              << dm.GetReferenceSequencePosition()
+                              << " num_errors=" << dm.GetNumErrors() << "\n";
+                  };
+                  size_t max_show = 10;
+                  for (size_t i = 0;
+                       i < mapping_metadata.positive_mappings_.size() &&
+                       i < max_show;
+                       ++i) {
+                    dbg_print_map("pos_map",
+                                  mapping_metadata.positive_mappings_[i]);
+                  }
+                  for (size_t i = 0;
+                       i < mapping_metadata.negative_mappings_.size() &&
+                       i < max_show;
+                       ++i) {
+                    dbg_print_map("neg_map",
+                                  mapping_metadata.negative_mappings_[i]);
+                  }
+                }
+#endif
 
                 const size_t current_num_draft_mappings =
                     mapping_metadata.GetNumDraftMappings();
