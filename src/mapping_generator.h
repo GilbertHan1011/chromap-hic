@@ -1,8 +1,10 @@
 #ifndef MAPPING_GENERATOR_H_
 #define MAPPING_GENERATOR_H_
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <numeric>
 #include <random>
 #include <tuple>
@@ -1319,42 +1321,6 @@ inline void MappingGenerator<PairsMapping>::GenerateBestMappingsForSingleEndRead
   const auto &pos_maps = mapping_metadata.positive_mappings_;
   const auto &neg_maps = mapping_metadata.negative_mappings_;
 
-  // Find the best positive and best negative mappings separately
-  int best_pos_idx = -1, best_neg_idx = -1;
-  int min_pos_err = 255, min_neg_err = 255;
-
-  for (size_t i = 0; i < pos_maps.size(); ++i) {
-    int err = pos_maps[i].GetNumErrors();
-    if (err < min_pos_err) {
-      min_pos_err = err;
-      best_pos_idx = i;
-    }
-  }
-
-  for (size_t i = 0; i < neg_maps.size(); ++i) {
-    int err = neg_maps[i].GetNumErrors();
-    if (err < min_neg_err) {
-      min_neg_err = err;
-      best_neg_idx = i;
-    }
-  }
-
-  // Need both a positive and negative mapping to form a pair
-  if (best_pos_idx == -1 || best_neg_idx == -1) {
-    return;
-  }
-
-  struct CoreCandidate {
-    bool is_positive;
-    int index;
-    int num_errors;
-  };
-
-  const CoreCandidate core1{/*is_positive=*/true, /*index=*/best_pos_idx, /*num_errors=*/min_pos_err};
-  const CoreCandidate core2{/*is_positive=*/false, /*index=*/best_neg_idx, /*num_errors=*/min_neg_err};
-
-  PairedEndMappingInMemory paired_mapping;
-
   const char *read = read_batch.GetSequenceAt(read_index);
   const uint32_t read_length = read_batch.GetSequenceLengthAt(read_index);
   const std::string &negative_read =
@@ -1363,15 +1329,266 @@ inline void MappingGenerator<PairsMapping>::GenerateBestMappingsForSingleEndRead
   const auto &pos_split_sites = mapping_metadata.positive_split_sites_;
   const auto &neg_split_sites = mapping_metadata.negative_split_sites_;
 
+  // Collect all mappings and classify them as 5' or 3' cores based on split position
+  struct CoreCandidate {
+    bool is_positive;
+    int index;
+    int num_errors;
+    int gap_beginning;  // Where alignment starts on read (0 = 5' end)
+    int read_mapping_length;  // How much of read is aligned
+    bool is_5p;  // True if this is a 5' core (gap < read_length/2)
+  };
+
+  std::vector<CoreCandidate> cores_5p;
+  std::vector<CoreCandidate> cores_3p;
+
+  auto decode_split_site = [](int ss) -> std::pair<int, int> {
+    int gap = (ss >> 16) & 0xff;
+    int read_len = ss & 0xffff;
+    return {gap, read_len};
+  };
+
+  // Process positive mappings
+  for (size_t i = 0; i < pos_maps.size(); ++i) {
+    int gap = 0, read_len = 0;
+    if (i < pos_split_sites.size()) {
+      auto [g, rl] = decode_split_site(pos_split_sites[i]);
+      gap = g;
+      read_len = rl;
+    }
+    bool is_5p = (gap < (int)read_length / 2);
+    CoreCandidate cc{/*is_positive=*/true, /*index=*/(int)i,
+                     /*num_errors=*/pos_maps[i].GetNumErrors(),
+                     gap, read_len, is_5p};
+    if (is_5p) {
+      cores_5p.push_back(cc);
+    } else {
+      cores_3p.push_back(cc);
+    }
+  }
+
+  // Process negative mappings
+  // IMPORTANT: For negative-strand mappings, gap is relative to the REVERSE COMPLEMENT
+  // The initial alignment uses BandedAlignPatternToTextWithDropOffFrom3End (3'-anchored on RC)
+  // If rescue is used, it switches to BandedAlignPatternToTextWithDropOff (5'-anchored on RC)
+  // 
+  // Key insight: When rescue succeeds, gap_beginning=0 is set, meaning alignment from start of RC
+  // - Start of reverse complement = 3' end of original read → 3' core
+  // - So for negative-strand: gap=0 typically means 3' core (opposite of positive-strand)
+  //
+  // However, if gap>0, it means we skipped some bases at the start of RC
+  // - Skipping start of RC = aligning later portion = 5' end of original read → 5' core
+  for (size_t i = 0; i < neg_maps.size(); ++i) {
+    int gap = 0, read_len = 0;
+    if (i < neg_split_sites.size()) {
+      auto [g, rl] = decode_split_site(neg_split_sites[i]);
+      gap = g;
+      read_len = rl;
+    }
+    // For negative-strand: gap=0 → start of RC → 3' end of original → 3' core
+    // gap>0 → skipped start of RC → later in RC → 5' end of original → 5' core
+    bool is_5p = (gap > 0);  // Only classify as 5' core if gap > 0
+    CoreCandidate cc{/*is_positive=*/false, /*index=*/(int)i,
+                     /*num_errors=*/neg_maps[i].GetNumErrors(),
+                     gap, read_len, is_5p};
+    if (is_5p) {
+      cores_5p.push_back(cc);
+    } else {
+      cores_3p.push_back(cc);
+    }
+  }
+
+  // Need at least one 5' core and one 3' core to form a pair
 #ifdef CHROMAP_DEBUG
-  // Debug stitched single-end cores: show chosen best pos/neg mappings.
+  {
+    const char *dbg_name = read_batch.GetSequenceNameAt(read_index);
+    if (std::string(dbg_name) ==
+            "LH00708:218:22WYCCLT4:6:1102:20578:1532") {
+      std::cerr << "DEBUG CORE CLASSIFICATION: read=" << dbg_name
+                << " cores_5p=" << cores_5p.size()
+                << " cores_3p=" << cores_3p.size() << "\n";
+      for (size_t i = 0; i < cores_5p.size(); ++i) {
+        const CoreCandidate &cc = cores_5p[i];
+        const DraftMapping &dm = cc.is_positive ? pos_maps[cc.index] : neg_maps[cc.index];
+        std::cerr << "  5p_core[" << i << "]: rid=" << dm.GetReferenceSequenceIndex()
+                  << " pos=" << dm.GetReferenceSequencePosition()
+                  << " err=" << cc.num_errors << " gap=" << cc.gap_beginning << "\n";
+      }
+      for (size_t i = 0; i < cores_3p.size(); ++i) {
+        const CoreCandidate &cc = cores_3p[i];
+        const DraftMapping &dm = cc.is_positive ? pos_maps[cc.index] : neg_maps[cc.index];
+        std::cerr << "  3p_core[" << i << "]: rid=" << dm.GetReferenceSequenceIndex()
+                  << " pos=" << dm.GetReferenceSequencePosition()
+                  << " err=" << cc.num_errors << " gap=" << cc.gap_beginning << "\n";
+      }
+    }
+  }
+#endif
+  if (cores_5p.empty() || cores_3p.empty()) {
+#ifdef CHROMAP_DEBUG
+    {
+      const char *dbg_name = read_batch.GetSequenceNameAt(read_index);
+      if (std::string(dbg_name) ==
+              "LH00708:218:22WYCCLT4:6:1102:20578:1532") {
+        std::cerr << "DEBUG EARLY RETURN: cores_5p=" << cores_5p.size()
+                  << " cores_3p=" << cores_3p.size() << " - cannot form pair\n";
+      }
+    }
+#endif
+    return;
+  }
+
+  // Sort each group by error count (lower is better)
+  std::sort(cores_5p.begin(), cores_5p.end(),
+            [](const CoreCandidate &a, const CoreCandidate &b) {
+              return a.num_errors < b.num_errors;
+            });
+  std::sort(cores_3p.begin(), cores_3p.end(),
+            [](const CoreCandidate &a, const CoreCandidate &b) {
+              return a.num_errors < b.num_errors;
+            });
+
+  // Pick best 5' core and best 3' core separately
+  const CoreCandidate &core1 = cores_5p[0];  // Best 5' core
+  const CoreCandidate &core2 = cores_3p[0];  // Best 3' core
+
+  // For debug output, create combined list of all cores
+  std::vector<CoreCandidate> all_cores;
+  all_cores.insert(all_cores.end(), cores_5p.begin(), cores_5p.end());
+  all_cores.insert(all_cores.end(), cores_3p.begin(), cores_3p.end());
+  std::sort(all_cores.begin(), all_cores.end(),
+            [](const CoreCandidate &a, const CoreCandidate &b) {
+              return a.num_errors < b.num_errors;
+            });
+
+  PairedEndMappingInMemory paired_mapping;
+
+#ifdef CHROMAP_DEBUG
+  // Debug stitched single-end cores: show chosen best 5' and 3' cores separately.
   std::cerr << "DEBUG STITCHED SE CORES read_index=" << read_index
             << " name=" << read_batch.GetSequenceNameAt(read_index) << "\n";
   std::cerr << "  pos_maps=" << pos_maps.size()
             << " neg_maps=" << neg_maps.size()
-            << " best_pos_idx=" << best_pos_idx << " err=" << min_pos_err
-            << " best_neg_idx=" << best_neg_idx << " err=" << min_neg_err
-            << "\n";
+            << " cores_5p=" << cores_5p.size()
+            << " cores_3p=" << cores_3p.size()
+            << " read_length=" << read_length << "\n";
+  std::cerr << "  selected_5p_core=" << (core1.is_positive ? "POS" : "NEG")
+            << " idx=" << core1.index << " err=" << core1.num_errors
+            << " gap=" << core1.gap_beginning << " len=" << core1.read_mapping_length << "\n";
+  std::cerr << "  selected_3p_core=" << (core2.is_positive ? "POS" : "NEG")
+            << " idx=" << core2.index << " err=" << core2.num_errors
+            << " gap=" << core2.gap_beginning << " len=" << core2.read_mapping_length << "\n";
+
+  // For detailed debugging of mis-mapped stitched reads, dump the
+  // per-core coordinates and scores for this read (top 10 only).
+  if (std::string(read_batch.GetSequenceNameAt(read_index)) ==
+          "LH00708:218:22WYCCLT4:6:1102:20578:1532") {
+    std::cerr << "  DEBUG STITCHED SE CORE LIST (read "
+              << read_batch.GetSequenceNameAt(read_index) << ", top 10)\n";
+    size_t max_show = std::min<size_t>(10, all_cores.size());
+    for (size_t i = 0; i < max_show; ++i) {
+      const CoreCandidate &cc = all_cores[i];
+      const DraftMapping &dm = cc.is_positive ? pos_maps[cc.index] : neg_maps[cc.index];
+      uint32_t rid = dm.GetReferenceSequenceIndex();
+      uint32_t ref_pos = dm.GetReferenceSequencePosition();
+      int num_err = dm.GetNumErrors();
+      
+      std::cerr << "    " << (cc.is_positive ? "POS" : "NEG") << "_CORE[" << i
+                << "] " << (cc.is_5p ? "[5']" : "[3']")
+                << ": rid=" << rid
+                << " ref_pos=" << ref_pos
+                << " num_errors=" << num_err;
+      
+      const auto &split_sites = cc.is_positive ? mapping_metadata.positive_split_sites_
+                                                : mapping_metadata.negative_split_sites_;
+      if (cc.index >= 0 && static_cast<size_t>(cc.index) < split_sites.size()) {
+        int ss = split_sites[cc.index];
+        int gap = (ss >> 16) & 0xff;
+        int read_len = ss & 0xffff;
+        int actual_err = (ss >> 24) & 0xff;
+        
+        // Decode alignment details
+        std::cerr << " gap=" << gap << " read_len=" << read_len
+                  << " actual_err=" << actual_err;
+        
+        // Calculate effective alignment length (approximate CIGAR match length)
+        // For negative num_errors, it's encoded as -(alignment_length)
+        int align_len = 0;
+        if (num_err < 0) {
+          align_len = -num_err;  // Encoded alignment length
+        } else {
+          // Estimate from read_len minus errors
+          align_len = read_len - actual_err;
+        }
+        
+        std::cerr << " align_len=" << align_len;
+        
+        // Show approximate CIGAR-like info
+        if (gap > 0) {
+          std::cerr << " cigar_approx=" << gap << "S" << align_len << "M";
+        } else {
+          std::cerr << " cigar_approx=" << align_len << "M";
+        }
+        
+        // Calculate error rate
+        if (align_len > 0) {
+          double err_rate = (actual_err > 0 ? static_cast<double>(actual_err) / align_len : 0.0) * 100.0;
+          std::cerr << " err_rate=" << std::fixed << std::setprecision(2) << err_rate << "%";
+        }
+        
+        // Investigate why alignment might be short
+        if (align_len < (int)read_length * 0.5 && align_len > 0) {
+          std::cerr << " [SHORT: only " << align_len << "bp of " << read_length << "bp aligned]";
+        }
+      }
+      
+      if (cc.is_5p && cc.index == core1.index) {
+        std::cerr << " [SELECTED_5P]";
+      } else if (!cc.is_5p && cc.index == core2.index) {
+        std::cerr << " [SELECTED_3P]";
+      }
+      std::cerr << "\n";
+    }
+    
+    // Summary: Why cores were selected
+    std::cerr << "  DEBUG CORE SELECTION SUMMARY:\n";
+    const DraftMapping &core1_dm = core1.is_positive ? pos_maps[core1.index] : neg_maps[core1.index];
+    const DraftMapping &core2_dm = core2.is_positive ? pos_maps[core2.index] : neg_maps[core2.index];
+    
+    std::cerr << "    Selected 5' core: chr" << (core1_dm.GetReferenceSequenceIndex() + 1)
+              << ":" << core1_dm.GetReferenceSequencePosition()
+              << " err=" << core1.num_errors
+              << " gap=" << core1.gap_beginning << " len=" << core1.read_mapping_length << "\n";
+    std::cerr << "    Selected 3' core: chr" << (core2_dm.GetReferenceSequenceIndex() + 1)
+              << ":" << core2_dm.GetReferenceSequencePosition()
+              << " err=" << core2.num_errors
+              << " gap=" << core2.gap_beginning << " len=" << core2.read_mapping_length << "\n";
+    
+    // Check if chr1 cores exist but weren't selected
+    std::cerr << "    chr1 cores found:\n";
+    for (size_t i = 0; i < all_cores.size(); ++i) {
+      const CoreCandidate &cc = all_cores[i];
+      const DraftMapping &dm = cc.is_positive ? pos_maps[cc.index] : neg_maps[cc.index];
+      if (dm.GetReferenceSequenceIndex() == 0) {  // chr1
+        bool selected = ((cc.is_5p && cc.index == core1.index) ||
+                         (!cc.is_5p && cc.index == core2.index));
+        std::cerr << "      chr1 " << (cc.is_5p ? "5'" : "3'") << " core: pos="
+                  << dm.GetReferenceSequencePosition()
+                  << " err=" << cc.num_errors
+                  << " gap=" << cc.gap_beginning << " len=" << cc.read_mapping_length
+                  << (selected ? " [SELECTED]" : " [NOT SELECTED]") << "\n";
+      }
+    }
+    
+    // Investigate why chr6 cores have low alignment scores
+    if (core1_dm.GetReferenceSequenceIndex() == 55 || core2_dm.GetReferenceSequenceIndex() == 55) {
+      std::cerr << "    INVESTIGATION: chr6 cores have align_len=70/69 but read_length="
+                << read_length << "\n";
+      std::cerr << "      This suggests the alignment is only covering part of the read.\n";
+      std::cerr << "      Check if gap_beginning=" << core1.gap_beginning
+                << " indicates soft-clipping or if alignment truly starts mid-read.\n";
+    }
+  }
 #endif
 
   auto setup_core = [&](bool first, const CoreCandidate &core) {

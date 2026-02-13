@@ -18,6 +18,7 @@
 #include "cxxopts.hpp"
 #include "draft_mapping_generator.h"
 #include "feature_barcode_matrix.h"
+#include "hit_utils.h"
 #include "index.h"
 #include "index_parameters.h"
 #include "khash.h"
@@ -433,8 +434,11 @@ void Chromap::MapSingleEndReads() {
 #ifdef CHROMAP_DEBUG
                 const char *dbg_read_name =
                     read_batch.GetSequenceNameAt(read_index);
-                if (std::string(dbg_read_name) ==
-                    "LH00708:218:22WYCCLT4:6:1102:18911:1532") {
+                std::string dbg_read_name_str(dbg_read_name);
+                if (dbg_read_name_str ==
+                    "LH00708:218:22WYCCLT4:6:1102:18911:1532" ||
+                    dbg_read_name_str ==
+                    "LH00708:218:22WYCCLT4:6:1102:20578:1532") {
                   std::cerr << "DEBUG CAND: read=" << dbg_read_name
                             << " num_minimizers="
                             << mapping_metadata.minimizers_.size()
@@ -455,12 +459,96 @@ void Chromap::MapSingleEndReads() {
                               << " count=" << c.count << "\n";
                   };
                   size_t max_show = 10;
+                  // Check for target in all candidates first (for problematic read)
+                  bool found_target = false;
+                  bool found_target_neg = false;
+                  uint32_t target_neg_pos = 0;
+                  if (dbg_read_name_str ==
+                      "LH00708:218:22WYCCLT4:6:1102:20578:1532") {
+                    const uint32_t target_rid = 0;  // chr1
+                    const uint32_t target_pos = 194541611;
+                    const uint32_t window = 1000;  // ±1kb window
+                    // Check positive candidates
+                    for (size_t i = 0;
+                         i < mapping_metadata.positive_candidates_.size();
+                         ++i) {
+                      const Candidate &c = mapping_metadata.positive_candidates_[i];
+                      uint32_t c_rid = c.GetReferenceSequenceIndex();
+                      uint32_t c_pos = c.GetReferenceSequencePosition();
+                      if (c_rid == target_rid &&
+                          c_pos >= target_pos - window &&
+                          c_pos <= target_pos + window) {
+                        found_target = true;
+                        break;
+                      }
+                    }
+                    // Check negative candidates (might be reverse complement match)
+                    for (size_t i = 0;
+                         i < mapping_metadata.negative_candidates_.size();
+                         ++i) {
+                      const Candidate &c = mapping_metadata.negative_candidates_[i];
+                      uint32_t c_rid = c.GetReferenceSequenceIndex();
+                      uint32_t c_pos = c.GetReferenceSequencePosition();
+                      if (c_rid == target_rid &&
+                          c_pos >= target_pos - window &&
+                          c_pos <= target_pos + window) {
+                        found_target_neg = true;
+                        target_neg_pos = c_pos;
+                        break;
+                      }
+                    }
+                    if (found_target_neg) {
+                      std::cerr << "  *** TARGET chr1:194541611 found as NEGATIVE candidate at pos="
+                                << target_neg_pos << " (reverse complement match) ***\n";
+                    }
+                  }
+                  // Show top candidates (max 10)
                   for (size_t i = 0;
                        i < mapping_metadata.positive_candidates_.size() &&
                        i < max_show;
                        ++i) {
-                    dbg_print_cand("pos",
-                                   mapping_metadata.positive_candidates_[i]);
+                    const Candidate &c = mapping_metadata.positive_candidates_[i];
+                    if (dbg_read_name_str ==
+                        "LH00708:218:22WYCCLT4:6:1102:20578:1532" &&
+                        found_target && i == 0) {
+                      std::cerr << "  Checking for chr1:194541611 in POS candidates:\n";
+                    }
+                    dbg_print_cand("pos", c);
+                  }
+                  if (dbg_read_name_str ==
+                      "LH00708:218:22WYCCLT4:6:1102:20578:1532") {
+                    if (!found_target) {
+                      std::cerr << "  *** TARGET chr1:194541611 NOT FOUND in "
+                                   "positive candidates ***\n";
+                    }
+                    // Check minimizer hits near target to understand why
+                    const uint32_t target_rid = 0;
+                    const uint32_t target_pos = 194541611;
+                    const uint32_t window = 2000;  // ±2kb window
+                    std::cerr << "  Checking minimizer hits near chr1:194541611:\n";
+                    int pos_hits_near = 0, neg_hits_near = 0;
+                    for (size_t i = 0; i < mapping_metadata.positive_hits_.size(); ++i) {
+                      uint64_t hit = mapping_metadata.positive_hits_[i];
+                      uint32_t hit_rid = HitToSequenceIndex(hit);
+                      if (hit_rid == target_rid) {
+                        uint32_t hit_pos = HitToSequencePosition(hit);
+                        if (hit_pos >= target_pos - window && hit_pos <= target_pos + window) {
+                          ++pos_hits_near;
+                        }
+                      }
+                    }
+                    for (size_t i = 0; i < mapping_metadata.negative_hits_.size(); ++i) {
+                      uint64_t hit = mapping_metadata.negative_hits_[i];
+                      uint32_t hit_rid = HitToSequenceIndex(hit);
+                      if (hit_rid == target_rid) {
+                        uint32_t hit_pos = HitToSequencePosition(hit);
+                        if (hit_pos >= target_pos - window && hit_pos <= target_pos + window) {
+                          ++neg_hits_near;
+                        }
+                      }
+                    }
+                    std::cerr << "    pos_hits_near=" << pos_hits_near
+                              << " neg_hits_near=" << neg_hits_near << "\n";
                   }
                   for (size_t i = 0;
                        i < mapping_metadata.negative_candidates_.size() &&
@@ -501,8 +589,11 @@ void Chromap::MapSingleEndReads() {
 #ifdef CHROMAP_DEBUG
                 const char *dbg_read_name =
                     read_batch.GetSequenceNameAt(read_index);
-                if (std::string(dbg_read_name) ==
-                    "LH00708:218:22WYCCLT4:6:1102:18911:1532") {
+                std::string dbg_read_name_str(dbg_read_name);
+                if (dbg_read_name_str ==
+                    "LH00708:218:22WYCCLT4:6:1102:18911:1532" ||
+                    dbg_read_name_str ==
+                    "LH00708:218:22WYCCLT4:6:1102:20578:1532") {
                   std::cerr << "DEBUG DRAFT: read=" << dbg_read_name
                             << " pos_maps="
                             << mapping_metadata.positive_mappings_.size()
@@ -518,12 +609,74 @@ void Chromap::MapSingleEndReads() {
                               << " num_errors=" << dm.GetNumErrors() << "\n";
                   };
                   size_t max_show = 10;
+                  // Check for target in all draft mappings first (for problematic read)
+                  bool found_target = false;
+                  bool found_target_neg = false;
+                  uint32_t target_neg_draft_pos = 0;
+                  int target_neg_draft_err = 0;
+                  if (dbg_read_name_str ==
+                      "LH00708:218:22WYCCLT4:6:1102:20578:1532") {
+                    const uint32_t target_rid = 0;  // chr1
+                    const uint32_t target_pos = 194541611;
+                    const uint32_t window = 1000;  // ±1kb window
+                    // Check positive draft mappings
+                    for (size_t i = 0;
+                         i < mapping_metadata.positive_mappings_.size();
+                         ++i) {
+                      const DraftMapping &dm = mapping_metadata.positive_mappings_[i];
+                      uint32_t dm_rid = dm.GetReferenceSequenceIndex();
+                      uint32_t dm_pos = dm.GetReferenceSequencePosition();
+                      if (dm_rid == target_rid &&
+                          dm_pos >= target_pos - window &&
+                          dm_pos <= target_pos + window) {
+                        found_target = true;
+                        break;
+                      }
+                    }
+                    // Check negative draft mappings (might be reverse complement)
+                    for (size_t i = 0;
+                         i < mapping_metadata.negative_mappings_.size();
+                         ++i) {
+                      const DraftMapping &dm = mapping_metadata.negative_mappings_[i];
+                      uint32_t dm_rid = dm.GetReferenceSequenceIndex();
+                      uint32_t dm_pos = dm.GetReferenceSequencePosition();
+                      if (dm_rid == target_rid &&
+                          dm_pos >= target_pos - window &&
+                          dm_pos <= target_pos + window) {
+                        found_target_neg = true;
+                        target_neg_draft_pos = dm_pos;
+                        target_neg_draft_err = dm.GetNumErrors();
+                        break;
+                      }
+                    }
+                    if (found_target_neg) {
+                      std::cerr << "  *** TARGET chr1:194541611 found as NEGATIVE draft mapping at pos="
+                                << target_neg_draft_pos << " err=" << target_neg_draft_err
+                                << " (reverse complement match) ***\n";
+                    }
+                  }
+                  // Show top draft mappings (max 10)
+                  if (dbg_read_name_str ==
+                      "LH00708:218:22WYCCLT4:6:1102:20578:1532" &&
+                      found_target) {
+                    std::cerr << "  Checking for chr1:194541611 in POS draft mappings:\n";
+                  }
                   for (size_t i = 0;
                        i < mapping_metadata.positive_mappings_.size() &&
                        i < max_show;
                        ++i) {
                     dbg_print_map("pos_map",
                                   mapping_metadata.positive_mappings_[i]);
+                  }
+                  if (dbg_read_name_str ==
+                      "LH00708:218:22WYCCLT4:6:1102:20578:1532") {
+                    if (!found_target && !found_target_neg) {
+                      std::cerr << "  *** TARGET chr1:194541611 NOT FOUND in "
+                                   "positive draft mappings ***\n";
+                    } else if (!found_target && found_target_neg) {
+                      std::cerr << "  *** TARGET chr1:194541611 only found as NEGATIVE draft mapping "
+                                   "(reverse complement) - may need strand-aware rescue ***\n";
+                    }
                   }
                   for (size_t i = 0;
                        i < mapping_metadata.negative_mappings_.size() &&

@@ -437,12 +437,75 @@ void DraftMappingGenerator::GenerateDraftMappingsOnOneStrand(
             read_mapping_length += gap_beginning;
           }
         }
+
+        // In stitched-read mode, if the 5'-anchored alignment is too short or fails,
+        // try a 3'-anchored alignment as a rescue. This handles cases where the
+        // candidate represents the 3' end of the read.
+        if (split_alignment_ && stitched_read_mode_ &&
+            (read_mapping_length < mapping_length_threshold ||
+             num_errors > error_threshold_ || mapping_end_position < 0)) {
+          int mapping_end_position3p = 0;
+          int read_mapping_length3p = 0;
+          int num_errors3p = BandedAlignPatternToTextWithDropOffFrom3End(
+              error_threshold_,
+              reference.GetSequenceAt(rid) + position - error_threshold_,
+              read, read_length,
+              &mapping_end_position3p, &read_mapping_length3p);
+
+          double error_rate3p = (read_mapping_length3p > 0)
+                                   ? static_cast<double>(num_errors3p) /
+                                         static_cast<double>(read_mapping_length3p)
+                                   : 1.0;
+          const double max_error_rate3p = 0.08;
+
+          if (mapping_end_position3p >= 0 &&
+              read_mapping_length3p >= mapping_length_threshold &&
+              read_mapping_length3p < (int)read_length &&
+              error_rate3p <= max_error_rate3p) {
+            // The 3'-anchored alignment succeeded! Use it.
+            num_errors = num_errors3p;
+            mapping_end_position = mapping_end_position3p;
+            read_mapping_length = read_mapping_length3p;
+            // For positive strand, 3'-anchored means we're aligning from the 3' end
+            // The unaligned portion is at the 5' end
+            gap_beginning = read_length - read_mapping_length3p;
+          }
+        }
       } else {
         num_errors = BandedAlignPatternToTextWithDropOffFrom3End(
             error_threshold_,
             reference.GetSequenceAt(rid) + position - error_threshold_,
             negative_read.data(), read_length, &mapping_end_position,
             &read_mapping_length);
+        
+#ifdef CHROMAP_DEBUG
+        // Diagnose why chr1:194541610 alignment failed
+        {
+          const char *dbg_name = read_batch.GetSequenceNameAt(read_index);
+          if (std::string(dbg_name) ==
+                  "LH00708:218:22WYCCLT4:6:1102:20578:1532" &&
+              rid == 0 && position >= 194541600 && position <= 194541650) {
+            std::cerr << "DEBUG NEG ALIGN INITIAL: read=" << dbg_name
+                      << " strand=- rid=" << rid << " pos=" << position << "\n"
+                      << "  After BandedAlignPatternToTextWithDropOffFrom3End:\n"
+                      << "    mapping_end_position=" << mapping_end_position
+                      << " read_mapping_length=" << read_mapping_length
+                      << " num_errors=" << num_errors
+                      << " read_length=" << read_length
+                      << " error_threshold=" << error_threshold_ << "\n"
+                      << "  Interpretation: Aligned " << read_mapping_length
+                      << "bp from 3' end with " << num_errors << " errors.\n";
+            if (read_mapping_length < 30) {
+              std::cerr << "  PROBLEM: Very short alignment (" << read_mapping_length
+                        << "bp). This suggests:\n"
+                        << "    1. The read doesn't match well from the 3' end\n"
+                        << "    2. This might be a 5' core that needs forward alignment\n"
+                        << "    3. Or the candidate position is incorrect\n";
+            }
+          }
+        }
+#endif
+        
         if (mapping_end_position < 0 && allow_gap_beginning > 0) {
           int backup_num_errors = num_errors;
           int backup_mapping_end_position = -mapping_end_position;
@@ -460,6 +523,80 @@ void DraftMappingGenerator::GenerateDraftMappingsOnOneStrand(
             gap_beginning = allow_gap_beginning;
             mapping_end_position += gap_beginning;
             read_mapping_length += gap_beginning;
+          }
+        }
+        
+        // In stitched-read mode, if the 3'-anchored alignment (from reverse complement 3' end)
+        // is too short or has too many errors, try a 5'-anchored alignment (from reverse complement 5' end)
+        // as a rescue. This is the dual-end anchoring strategy for negative-strand candidates.
+        if (split_alignment_ && stitched_read_mode_ &&
+            (read_mapping_length < mapping_length_threshold ||
+             num_errors > error_threshold_ || mapping_end_position < 0)) {
+          int mapping_end_position5p = 0;
+          int read_mapping_length5p = 0;
+          int num_errors5p = BandedAlignPatternToTextWithDropOff(
+              error_threshold_,
+              reference.GetSequenceAt(rid) + position - error_threshold_,
+              negative_read.data(), read_length,
+              &mapping_end_position5p, &read_mapping_length5p);
+
+#ifdef CHROMAP_DEBUG
+          {
+            const char *dbg_name = read_batch.GetSequenceNameAt(read_index);
+            if (std::string(dbg_name) ==
+                    "LH00708:218:22WYCCLT4:6:1102:20578:1532" &&
+                rid == 0 && position >= 194541600 && position <= 194541650) {
+              std::cerr << "DEBUG NEG 5P RESCUE SEARCH: read=" << dbg_name
+                        << " strand=- rid=" << rid << " pos=" << position << "\n"
+                        << "  3'-anchored result: read_len=" << read_mapping_length
+                        << " num_errors=" << num_errors
+                        << " mapping_end=" << mapping_end_position << "\n"
+                        << "  5'-anchored attempt: read_len=" << read_mapping_length5p
+                        << " num_errors=" << num_errors5p
+                        << " mapping_end=" << mapping_end_position5p << "\n";
+            }
+          }
+#endif
+
+          // For stitched Hi-C, treat the 5'-anchored alignment as a "hint":
+          // accept long prefixes even if their absolute num_errors exceeds the
+          // global error_threshold_, as long as the error *rate* is small.
+          double error_rate5p = (read_mapping_length5p > 0)
+                                   ? static_cast<double>(num_errors5p) /
+                                         static_cast<double>(read_mapping_length5p)
+                                   : 1.0;
+          const double max_error_rate5p = 0.08;  // allow up to 8% errors for prefix
+
+          if (mapping_end_position5p >= 0 &&
+              read_mapping_length5p >= mapping_length_threshold &&
+              read_mapping_length5p < (int)read_length &&
+              error_rate5p <= max_error_rate5p) {
+            // The 5'-anchored alignment succeeded! Use it.
+            num_errors = num_errors5p;
+            mapping_end_position = mapping_end_position5p;
+            read_mapping_length = read_mapping_length5p;
+
+            // CRITICAL FIX: For negative strand, 5'-anchored alignment on RC
+            // means we're aligning from the 5' end of the original read.
+            // Set gap_beginning to indicate this is a 5' core.
+            // The unaligned portion is at the 3' end of the original read.
+            gap_beginning = read_length - read_mapping_length5p;
+
+#ifdef CHROMAP_DEBUG
+            {
+              const char *dbg_name = read_batch.GetSequenceNameAt(read_index);
+              if (std::string(dbg_name) ==
+                      "LH00708:218:22WYCCLT4:6:1102:20578:1532" &&
+                  rid == 0 && position >= 194541600 && position <= 194541650) {
+                std::cerr << "DEBUG NEG 5P RESCUE OK: read=" << dbg_name
+                          << " rid=" << rid << " pos=" << position
+                          << " num_errors5p=" << num_errors5p
+                          << " read_mapping_length5p=" << read_mapping_length5p
+                          << " error_rate5p=" << error_rate5p
+                          << " gap_beginning=" << gap_beginning << " (5' core indicator)\n";
+              }
+            }
+#endif
           }
         }
       }
@@ -486,8 +623,47 @@ void DraftMappingGenerator::GenerateDraftMappingsOnOneStrand(
       }
 #endif
 
+      // Debug for chr1:194541610 investigation
+#ifdef CHROMAP_DEBUG
+      {
+        const char *dbg_name = read_batch.GetSequenceNameAt(read_index);
+        if (std::string(dbg_name) ==
+                "LH00708:218:22WYCCLT4:6:1102:20578:1532" &&
+            rid == 0 && position >= 194541600 && position <= 194541650 &&
+            candidate_strand == kNegative) {
+          std::cerr << "DEBUG ALIGN_LEN CALC: read=" << dbg_name
+                    << " strand=- rid=" << rid << " pos=" << position << "\n"
+                    << "  BEFORE align_len calc:\n"
+                    << "    mapping_end_position=" << mapping_end_position
+                    << " num_errors=" << num_errors
+                    << " gap_beginning=" << gap_beginning
+                    << " read_mapping_length=" << read_mapping_length
+                    << " error_threshold=" << error_threshold_
+                    << " read_length=" << read_length << "\n";
+        }
+      }
+#endif
+
       int align_len = mapping_end_position + 1 - error_threshold_ - num_errors -
                       gap_beginning;
+
+#ifdef CHROMAP_DEBUG
+      {
+        const char *dbg_name = read_batch.GetSequenceNameAt(read_index);
+        if (std::string(dbg_name) ==
+                "LH00708:218:22WYCCLT4:6:1102:20578:1532" &&
+            rid == 0 && position >= 194541600 && position <= 194541650 &&
+            candidate_strand == kNegative) {
+          std::cerr << "  AFTER align_len calc:\n"
+                    << "    align_len=" << align_len
+                    << " (formula: " << mapping_end_position << " + 1 - "
+                    << error_threshold_ << " - " << num_errors << " - "
+                    << gap_beginning << ")\n"
+                    << "    threshold=" << mapping_length_threshold
+                    << " -> " << (align_len >= mapping_length_threshold ? "KEEP" : "DISCARD") << "\n";
+        }
+      }
+#endif
 
       // In stitched-read mode, if the 5'-anchored split alignment is too short
       // or has too many errors, try a 3'-anchored alignment to discover the
@@ -644,6 +820,33 @@ void DraftMappingGenerator::GenerateDraftMappingsOnOneStrand(
         num_errors = -(mapping_end_position - error_threshold_ - num_errors -
                        gap_beginning);
 
+#ifdef CHROMAP_DEBUG
+        // Investigate why chr6 cores have short alignments
+        {
+          const char *dbg_name = read_batch.GetSequenceNameAt(read_index);
+          if (std::string(dbg_name) ==
+                  "LH00708:218:22WYCCLT4:6:1102:20578:1532" &&
+              ((rid == 55 && (position == 102168919 || position == 84164305)) ||
+               (rid == 0 && position >= 194541600 && position <= 194541650))) {
+            std::cerr << "DEBUG KEPT ALIGNMENT: read=" << dbg_name
+                      << " strand=" << (candidate_strand == kPositive ? '+' : '-')
+                      << " rid=" << rid << " pos=" << position << "\n"
+                      << "  align_len=" << align_len
+                      << " read_length=" << read_length
+                      << " gap_beginning=" << gap_beginning
+                      << " read_mapping_length=" << read_mapping_length
+                      << " mapping_end_position=" << mapping_end_position
+                      << " num_errors=" << actual_num_errors
+                      << " encoded_num_errors=" << num_errors << "\n";
+            if (align_len < (int)read_length * 0.5) {
+              std::cerr << "  WARNING: Short alignment! Only " << align_len
+                        << "bp of " << read_length << "bp aligned ("
+                        << (align_len * 100 / read_length) << "%)\n";
+            }
+          }
+        }
+#endif
+
         if (candidates.size() > 200) {
           if (candidate_strand == kPositive) {
             longest_match = GetLongestMatchLength(
@@ -673,7 +876,26 @@ void DraftMappingGenerator::GenerateDraftMappingsOnOneStrand(
                     << " rid=" << rid
                     << " pos=" << position
                     << " align_len=" << align_len
-                    << " < min_len=" << mapping_length_threshold << "\n";
+                    << " < min_len=" << mapping_length_threshold;
+          
+          // Detailed investigation for chr1:194541610 discard
+          const char *dbg_name = read_batch.GetSequenceNameAt(read_index);
+          if (std::string(dbg_name) ==
+                  "LH00708:218:22WYCCLT4:6:1102:20578:1532" &&
+              rid == 0 && position >= 194541600 && position <= 194541650) {
+            std::cerr << "\n    *** INVESTIGATING chr1:194541610 DISCARD ***\n"
+                      << "      mapping_end_position=" << mapping_end_position
+                      << " num_errors=" << num_errors
+                      << " gap_beginning=" << gap_beginning
+                      << " read_mapping_length=" << read_mapping_length
+                      << " error_threshold=" << error_threshold_
+                      << " read_length=" << read_length
+                      << "\n      align_len formula: " << mapping_end_position << " + 1 - "
+                      << error_threshold_ << " - " << num_errors << " - " << gap_beginning
+                      << " = " << align_len << "\n";
+          } else {
+            std::cerr << "\n";
+          }
         }
         ++discard_count_for_read;
 #endif
