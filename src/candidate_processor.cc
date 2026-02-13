@@ -483,4 +483,144 @@ void CandidateProcessor::ReduceCandidatesForPairedEndReadOnOneDirection(
   }
 }
 
+void CandidateProcessor::FilterDanglingCandidatesForSingleEnd(
+    uint32_t dangling_threshold,
+    MappingMetadata &mapping_metadata) const {
+
+  std::vector<Candidate> &positive_candidates = mapping_metadata.positive_candidates_;
+  std::vector<Candidate> &negative_candidates = mapping_metadata.negative_candidates_;
+
+  // Filter positive strand candidates
+  std::vector<Candidate> filtered_positive;
+  for (const auto &pos_cand : positive_candidates) {
+    bool is_dangling = false;
+    uint32_t pos_rid = pos_cand.GetReferenceSequenceIndex();
+    uint32_t pos_position = pos_cand.GetReferenceSequencePosition();
+
+    for (const auto &neg_cand : negative_candidates) {
+      uint32_t neg_rid = neg_cand.GetReferenceSequenceIndex();
+      if (pos_rid != neg_rid) continue;
+
+      uint32_t neg_position = neg_cand.GetReferenceSequencePosition();
+      uint32_t distance = (pos_position > neg_position) ?
+                         (pos_position - neg_position) :
+                         (neg_position - pos_position);
+      if (distance <= dangling_threshold) {
+        is_dangling = true;
+        break;
+      }
+    }
+
+    if (!is_dangling) {
+      filtered_positive.push_back(pos_cand);
+    }
+  }
+
+  // Filter negative strand candidates
+  std::vector<Candidate> filtered_negative;
+  for (const auto &neg_cand : negative_candidates) {
+    bool is_dangling = false;
+    uint32_t neg_rid = neg_cand.GetReferenceSequenceIndex();
+    uint32_t neg_position = neg_cand.GetReferenceSequencePosition();
+
+    for (const auto &pos_cand : positive_candidates) {
+      uint32_t pos_rid = pos_cand.GetReferenceSequenceIndex();
+      if (pos_rid != neg_rid) continue;
+
+      uint32_t pos_position = pos_cand.GetReferenceSequencePosition();
+      uint32_t distance = (pos_position > neg_position) ?
+                         (pos_position - neg_position) :
+                         (neg_position - pos_position);
+      if (distance <= dangling_threshold) {
+        is_dangling = true;
+        break;
+      }
+    }
+
+    if (!is_dangling) {
+      filtered_negative.push_back(neg_cand);
+    }
+  }
+
+  positive_candidates = std::move(filtered_positive);
+  negative_candidates = std::move(filtered_negative);
+}
+
+void CandidateProcessor::FilterDanglingCandidatesForPairedEnd(
+    uint32_t dangling_threshold,
+    PairedEndMappingMetadata &paired_end_mapping_metadata) const {
+
+  std::vector<Candidate> &r1_positive =
+      paired_end_mapping_metadata.mapping_metadata1_.positive_candidates_;
+  std::vector<Candidate> &r1_negative =
+      paired_end_mapping_metadata.mapping_metadata1_.negative_candidates_;
+  std::vector<Candidate> &r2_positive =
+      paired_end_mapping_metadata.mapping_metadata2_.positive_candidates_;
+  std::vector<Candidate> &r2_negative =
+      paired_end_mapping_metadata.mapping_metadata2_.negative_candidates_;
+
+  // Helper lambda to check if candidate is dangling against another set
+  auto is_dangling_against = [dangling_threshold](
+      const Candidate &cand,
+      const std::vector<Candidate> &others) {
+    uint32_t cand_rid = cand.GetReferenceSequenceIndex();
+    uint32_t cand_pos = cand.GetReferenceSequencePosition();
+
+    for (const auto &other : others) {
+      uint32_t other_rid = other.GetReferenceSequenceIndex();
+      if (cand_rid != other_rid) continue;
+
+      uint32_t other_pos = other.GetReferenceSequencePosition();
+      uint32_t distance = (cand_pos > other_pos) ?
+                         (cand_pos - other_pos) :
+                         (other_pos - cand_pos);
+      if (distance <= dangling_threshold) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  // Filter R1 positive against R2 (both strands)
+  std::vector<Candidate> filtered_r1_positive;
+  for (const auto &cand : r1_positive) {
+    if (!is_dangling_against(cand, r2_positive) &&
+        !is_dangling_against(cand, r2_negative)) {
+      filtered_r1_positive.push_back(cand);
+    }
+  }
+
+  // Filter R1 negative against R2 (both strands)
+  std::vector<Candidate> filtered_r1_negative;
+  for (const auto &cand : r1_negative) {
+    if (!is_dangling_against(cand, r2_positive) &&
+        !is_dangling_against(cand, r2_negative)) {
+      filtered_r1_negative.push_back(cand);
+    }
+  }
+
+  // Filter R2 positive against R1 (both strands)
+  std::vector<Candidate> filtered_r2_positive;
+  for (const auto &cand : r2_positive) {
+    if (!is_dangling_against(cand, r1_positive) &&
+        !is_dangling_against(cand, r1_negative)) {
+      filtered_r2_positive.push_back(cand);
+    }
+  }
+
+  // Filter R2 negative against R1 (both strands)
+  std::vector<Candidate> filtered_r2_negative;
+  for (const auto &cand : r2_negative) {
+    if (!is_dangling_against(cand, r1_positive) &&
+        !is_dangling_against(cand, r1_negative)) {
+      filtered_r2_negative.push_back(cand);
+    }
+  }
+
+  r1_positive = std::move(filtered_r1_positive);
+  r1_negative = std::move(filtered_r1_negative);
+  r2_positive = std::move(filtered_r2_positive);
+  r2_negative = std::move(filtered_r2_negative);
+}
+
 }  // namespace chromap

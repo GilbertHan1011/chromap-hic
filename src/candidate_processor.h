@@ -39,6 +39,14 @@ class CandidateProcessor {
       uint32_t mapping_positions_distance,
       PairedEndMappingMetadata &paired_end_mapping_metadata) const;
 
+  void FilterDanglingCandidatesForSingleEnd(
+      uint32_t dangling_threshold,
+      MappingMetadata &mapping_metadata) const;
+
+  void FilterDanglingCandidatesForPairedEnd(
+      uint32_t dangling_threshold,
+      PairedEndMappingMetadata &paired_end_mapping_metadata) const;
+
  private:
   void GenerateCandidatesOnOneStrand(int error_threshold,
                                      int num_seeds_required,

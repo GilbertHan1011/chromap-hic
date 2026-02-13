@@ -30,6 +30,9 @@ void AddMappingOptions(cxxopts::Options &options) {
       "ChIP-seq reads\nhic: mapping Hi-C reads",
       cxxopts::value<std::string>(),
       "STR")("split-alignment", "Allow split alignments")(
+      "stitched-read-mode", "Enable stitched read mode for Hi-C (forces split-alignment)")(
+      "dangling-threshold", "Distance threshold for filtering dangling ends [1000]",
+      cxxopts::value<int>(), "INT")(
       "e,error-threshold", "Max # errors allowed to map a read [8]",
       cxxopts::value<int>(), "INT")
       //("A,match-score", "Match score [1]", cxxopts::value<int>(), "INT")
@@ -408,6 +411,17 @@ void ChromapDriver::ParseArgsAndRun(int argc, char *argv[]) {
   if (result.count("split-alignment")) {
     mapping_parameters.split_alignment = true;
   }
+  if (result.count("stitched-read-mode")) {
+    mapping_parameters.stitched_read_mode = true;
+    mapping_parameters.split_alignment = true;
+    if (mapping_parameters.max_num_best_mappings < 2) {
+      std::cerr << "Warning: stitched-read-mode requires max-num-best-mappings >= 2, setting to 2\n";
+      mapping_parameters.max_num_best_mappings = 2;
+    }
+  }
+  if (result.count("dangling-threshold")) {
+    mapping_parameters.dangling_threshold = result["dangling-threshold"].as<int>();
+  }
   if (result.count("output-mappings-not-in-whitelist")) {
     mapping_parameters.output_mappings_not_in_whitelist = true;
   }
@@ -645,6 +659,10 @@ void ChromapDriver::ParseArgsAndRun(int argc, char *argv[]) {
     if (mapping_parameters.split_alignment) {
       std::cerr << "Allow split alignment.\n";
     }
+    if (mapping_parameters.stitched_read_mode) {
+      std::cerr << "Stitched read mode enabled with dangling threshold: "
+                << mapping_parameters.dangling_threshold << " bp\n";
+    }
 
     switch (mapping_parameters.mapping_output_format) {
       case MAPPINGFORMAT_BED:
@@ -713,7 +731,11 @@ void ChromapDriver::ParseArgsAndRun(int argc, char *argv[]) {
           break;
         }
         case MAPPINGFORMAT_PAIRS:
-          chromap::ExitWithMessage("No support for single-end HiC yet!");
+          if (!mapping_parameters.stitched_read_mode) {
+            chromap::ExitWithMessage("No support for single-end HiC yet! Use --stitched-read-mode for stitched reads.");
+          }
+          // Allow single-end PAIRS for stitched mode
+          chromap_for_mapping.MapSingleEndReads<chromap::PairsMapping>();
           break;
         case MAPPINGFORMAT_BED:
         case MAPPINGFORMAT_TAGALIGN:

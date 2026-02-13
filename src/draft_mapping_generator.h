@@ -18,6 +18,7 @@ class DraftMappingGenerator {
   DraftMappingGenerator(const MappingParameters &mapping_parameters)
       : error_threshold_(mapping_parameters.error_threshold),
         split_alignment_(mapping_parameters.split_alignment),
+        stitched_read_mode_(mapping_parameters.stitched_read_mode),
         num_vpu_lanes_(mapping_parameters.GetNumVPULanes()),
         mapping_output_format_(mapping_parameters.mapping_output_format) {}
 
@@ -54,6 +55,7 @@ class DraftMappingGenerator {
 
   const int error_threshold_;
   const bool split_alignment_;
+  const bool stitched_read_mode_;
   const int num_vpu_lanes_;
   const MappingOutputFormat mapping_output_format_;
 };

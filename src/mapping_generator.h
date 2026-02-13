@@ -119,8 +119,66 @@ void MappingGenerator<MappingRecord>::GenerateBestMappingsForSingleEndRead(
     std::vector<std::vector<MappingRecord>> &mappings_on_diff_ref_seqs) {
   const int num_best_mappings = mapping_metadata.num_best_mappings_;
 
-  // We use reservoir sampling when the number of best mappings exceeds the
-  // threshold.
+  // Stitched mode: explicitly select best 5' and best 3' mappings
+  if (mapping_parameters_.stitched_read_mode) {
+    std::vector<int> best_mapping_indices;
+
+    // Find best positive mapping (5' end)
+    int best_pos_idx = -1;
+    int min_pos_err = 255;
+    const auto& pos_maps = mapping_metadata.positive_mappings_;
+    for (size_t i = 0; i < pos_maps.size(); ++i) {
+      if (pos_maps[i].GetNumErrors() <= mapping_parameters_.error_threshold &&
+          pos_maps[i].GetNumErrors() < min_pos_err) {
+        min_pos_err = pos_maps[i].GetNumErrors();
+        best_pos_idx = i;
+      }
+    }
+    if (best_pos_idx != -1) {
+      best_mapping_indices.push_back(best_pos_idx);
+    }
+
+    // Find best negative mapping (3' end)
+    int best_neg_idx = -1;
+    int min_neg_err = 255;
+    const auto& neg_maps = mapping_metadata.negative_mappings_;
+    for (size_t i = 0; i < neg_maps.size(); ++i) {
+      if (neg_maps[i].GetNumErrors() <= mapping_parameters_.error_threshold &&
+          neg_maps[i].GetNumErrors() < min_neg_err) {
+        min_neg_err = neg_maps[i].GetNumErrors();
+        best_neg_idx = i;
+      }
+    }
+    if (best_neg_idx != -1) {
+      best_mapping_indices.push_back(pos_maps.size() + best_neg_idx);
+    }
+
+    // Process selected mappings
+    if (!best_mapping_indices.empty()) {
+      std::sort(best_mapping_indices.begin(), best_mapping_indices.end());
+
+      // Update metadata for MAPQ calculation
+      mapping_metadata.min_num_errors_ = std::min(min_pos_err, min_neg_err);
+
+      int best_mapping_index = 0;
+      int num_best_mappings_reported = 0;
+
+      ProcessBestMappingsForSingleEndRead(
+          kPositive, read_index, read_batch, barcode_batch, reference,
+          mapping_metadata, best_mapping_indices, best_mapping_index,
+          num_best_mappings_reported, mappings_on_diff_ref_seqs);
+
+      if (num_best_mappings_reported < static_cast<int>(best_mapping_indices.size())) {
+        ProcessBestMappingsForSingleEndRead(
+            kNegative, read_index, read_batch, barcode_batch, reference,
+            mapping_metadata, best_mapping_indices, best_mapping_index,
+            num_best_mappings_reported, mappings_on_diff_ref_seqs);
+      }
+    }
+    return;
+  }
+
+  // Standard mode: use reservoir sampling
   std::vector<int> best_mapping_indices(
       mapping_parameters_.max_num_best_mappings);
   std::iota(best_mapping_indices.begin(), best_mapping_indices.end(), 0);
@@ -1189,6 +1247,112 @@ uint8_t MappingGenerator<MappingRecord>::GetMAPQForPairedEndRead(
   }
 
   return (uint8_t)mapq;
+}
+
+// Forward declaration for PairsMapping specializations
+template <>
+void MappingGenerator<PairsMapping>::EmplaceBackPairedEndMappingRecord(
+    PairedEndMappingInMemory &paired_end_mapping_in_memory,
+    std::vector<std::vector<PairsMapping>> &mappings_on_diff_ref_seqs);
+
+// Template specialization for PairsMapping in stitched mode
+template <>
+inline void MappingGenerator<PairsMapping>::GenerateBestMappingsForSingleEndRead(
+    const SequenceBatch &read_batch, uint32_t read_index,
+    const SequenceBatch &reference, const SequenceBatch &barcode_batch,
+    MappingMetadata &mapping_metadata,
+    std::vector<std::vector<PairsMapping>> &mappings_on_diff_ref_seqs) {
+
+  if (!mapping_parameters_.stitched_read_mode) {
+    // Should not reach here - PAIRS format requires stitched mode for single-end
+    return;
+  }
+
+  // Find best positive and negative mappings
+  int best_pos_idx = -1, best_neg_idx = -1;
+  int min_pos_err = 255, min_neg_err = 255;
+
+  const auto& pos_maps = mapping_metadata.positive_mappings_;
+  for (size_t i = 0; i < pos_maps.size(); ++i) {
+    if (pos_maps[i].GetNumErrors() <= mapping_parameters_.error_threshold &&
+        pos_maps[i].GetNumErrors() < min_pos_err) {
+      min_pos_err = pos_maps[i].GetNumErrors();
+      best_pos_idx = i;
+    }
+  }
+
+  const auto& neg_maps = mapping_metadata.negative_mappings_;
+  for (size_t i = 0; i < neg_maps.size(); ++i) {
+    if (neg_maps[i].GetNumErrors() <= mapping_parameters_.error_threshold &&
+        neg_maps[i].GetNumErrors() < min_neg_err) {
+      min_neg_err = neg_maps[i].GetNumErrors();
+      best_neg_idx = i;
+    }
+  }
+
+  // Only create PAIRS record if we have both ends
+  if (best_pos_idx == -1 || best_neg_idx == -1) {
+    return;
+  }
+
+  // Create PairedEndMappingInMemory from the two single-end mappings
+  PairedEndMappingInMemory paired_mapping;
+
+  const char *read = read_batch.GetSequenceAt(read_index);
+  const uint32_t read_length = read_batch.GetSequenceLengthAt(read_index);
+  const std::string &negative_read = read_batch.GetNegativeSequenceAt(read_index);
+
+  // Get split sites if available
+  const auto& pos_split_sites = mapping_metadata.positive_split_sites_;
+  const auto& neg_split_sites = mapping_metadata.negative_split_sites_;
+
+  // Setup mapping 1 (5' end - positive strand)
+  const DraftMapping& pos_mapping = pos_maps[best_pos_idx];
+  paired_mapping.mapping_in_memory1.read_id = read_batch.GetSequenceIdAt(read_index);
+  paired_mapping.mapping_in_memory1.read_name = read_batch.GetSequenceNameAt(read_index);
+  paired_mapping.mapping_in_memory1.strand = kPositive;
+  paired_mapping.mapping_in_memory1.rid = pos_mapping.GetReferenceSequenceIndex();
+  paired_mapping.mapping_in_memory1.read_sequence = read;
+  paired_mapping.mapping_in_memory1.read_length = read_length;
+
+  if (mapping_parameters_.split_alignment && best_pos_idx < pos_split_sites.size()) {
+    paired_mapping.mapping_in_memory1.read_split_site = pos_split_sites[best_pos_idx];
+  }
+
+  GetRefStartEndPositionForReadFromMapping(
+      pos_mapping, reference, paired_mapping.mapping_in_memory1);
+
+  // Setup mapping 2 (3' end - negative strand)
+  const DraftMapping& neg_mapping = neg_maps[best_neg_idx];
+  paired_mapping.mapping_in_memory2.read_id = read_batch.GetSequenceIdAt(read_index);
+  paired_mapping.mapping_in_memory2.read_name = read_batch.GetSequenceNameAt(read_index);
+  paired_mapping.mapping_in_memory2.strand = kNegative;
+  paired_mapping.mapping_in_memory2.rid = neg_mapping.GetReferenceSequenceIndex();
+  paired_mapping.mapping_in_memory2.read_sequence = negative_read.data();
+  paired_mapping.mapping_in_memory2.read_length = read_length;
+
+  if (mapping_parameters_.split_alignment && best_neg_idx < neg_split_sites.size()) {
+    paired_mapping.mapping_in_memory2.read_split_site = neg_split_sites[best_neg_idx];
+  }
+
+  GetRefStartEndPositionForReadFromMapping(
+      neg_mapping, reference, paired_mapping.mapping_in_memory2);
+
+  // Set barcode if needed
+  uint64_t barcode_key = 0;
+  if (!mapping_parameters_.is_bulk_data) {
+    barcode_key = barcode_batch.GenerateSeedFromSequenceAt(
+        read_index, 0, barcode_batch.GetSequenceLengthAt(read_index));
+  }
+  paired_mapping.mapping_in_memory1.barcode_key = barcode_key;
+  paired_mapping.mapping_in_memory2.barcode_key = barcode_key;
+
+  // Calculate MAPQ - use simplified version for stitched mode
+  paired_mapping.mapq = 30;  // Default MAPQ for stitched mode
+  paired_mapping.is_unique = (mapping_metadata.num_best_mappings_ == 1);
+
+  // Create the PAIRS record
+  EmplaceBackPairedEndMappingRecord(paired_mapping, mappings_on_diff_ref_seqs);
 }
 
 }  // namespace chromap

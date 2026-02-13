@@ -53,6 +53,8 @@ struct MappingParameters {
   bool output_mappings_not_in_whitelist = false;
   bool Tn5_shift = false;
   bool split_alignment = false;
+  bool stitched_read_mode = false;
+  int dangling_threshold = 1000;  // in base pairs
   MappingOutputFormat mapping_output_format = MAPPINGFORMAT_BED;
   bool low_memory_mode = false;
   bool cell_by_bin = false;

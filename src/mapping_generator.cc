@@ -79,7 +79,54 @@ void MappingGenerator<PairedPAFMapping>::EmplaceBackSingleEndMappingRecord(
 template <>
 void MappingGenerator<PairsMapping>::EmplaceBackSingleEndMappingRecord(
     MappingInMemory &mapping_in_memory,
-    std::vector<std::vector<PairsMapping>> &mappings_on_diff_ref_seqs) = delete;
+    std::vector<std::vector<PairsMapping>> &mappings_on_diff_ref_seqs) {
+  // For stitched mode: This should not be called directly
+  // Instead, use the specialized stitched mode handling in GenerateBestMappingsForSingleEndRead
+  // If we reach here, it means there's only one end mapped, which we'll skip for PAIRS format
+}
+
+template <>
+void MappingGenerator<PairsMapping>::EmplaceBackPairedEndMappingRecord(
+    PairedEndMappingInMemory &paired_end_mapping_in_memory,
+    std::vector<std::vector<PairsMapping>> &mappings_on_diff_ref_seqs) {
+  uint8_t strand1 = paired_end_mapping_in_memory.mapping_in_memory1.GetStrand();
+  uint8_t strand2 = paired_end_mapping_in_memory.mapping_in_memory2.GetStrand();
+
+  int position1 =
+      paired_end_mapping_in_memory.mapping_in_memory1.ref_start_position;
+  int position2 =
+      paired_end_mapping_in_memory.mapping_in_memory2.ref_start_position;
+
+  if (paired_end_mapping_in_memory.mapping_in_memory1.strand == kNegative) {
+    position1 =
+        paired_end_mapping_in_memory.mapping_in_memory1.ref_end_position;
+  }
+
+  if (paired_end_mapping_in_memory.mapping_in_memory2.strand == kNegative) {
+    position2 =
+        paired_end_mapping_in_memory.mapping_in_memory2.ref_end_position;
+  }
+
+  int rid1 = paired_end_mapping_in_memory.mapping_in_memory1.rid;
+  int rid2 = paired_end_mapping_in_memory.mapping_in_memory2.rid;
+  const int rid1_rank = pairs_custom_rid_rank_[rid1];
+  const int rid2_rank = pairs_custom_rid_rank_[rid2];
+
+  const bool is_rid1_rank_smaller =
+      rid1_rank < rid2_rank || (rid1 == rid2 && position1 < position2);
+  if (!is_rid1_rank_smaller) {
+    std::swap(rid1, rid2);
+    std::swap(position1, position2);
+    std::swap(strand1, strand2);
+  }
+
+  mappings_on_diff_ref_seqs[rid1].emplace_back(
+      paired_end_mapping_in_memory.GetReadId(),
+      std::string(paired_end_mapping_in_memory.mapping_in_memory1.read_name),
+      paired_end_mapping_in_memory.GetBarcode(), rid1, rid2, position1,
+      position2, strand1, strand2, paired_end_mapping_in_memory.mapq,
+      paired_end_mapping_in_memory.is_unique, /*num_dups=*/1);
+}
 
 template <>
 void MappingGenerator<SAMMapping>::EmplaceBackPairedEndMappingRecord(
@@ -164,49 +211,6 @@ void MappingGenerator<PairedPAFMapping>::EmplaceBackPairedEndMappingRecord(
           paired_end_mapping_in_memory.mapping_in_memory2.mapq,
           paired_end_mapping_in_memory.GetStrand(),
           paired_end_mapping_in_memory.is_unique, /*num_dups=*/1);
-}
-
-template <>
-void MappingGenerator<PairsMapping>::EmplaceBackPairedEndMappingRecord(
-    PairedEndMappingInMemory &paired_end_mapping_in_memory,
-    std::vector<std::vector<PairsMapping>> &mappings_on_diff_ref_seqs) {
-  uint8_t strand1 = paired_end_mapping_in_memory.mapping_in_memory1.GetStrand();
-  uint8_t strand2 = paired_end_mapping_in_memory.mapping_in_memory2.GetStrand();
-
-  int position1 =
-      paired_end_mapping_in_memory.mapping_in_memory1.ref_start_position;
-  int position2 =
-      paired_end_mapping_in_memory.mapping_in_memory2.ref_start_position;
-
-  if (paired_end_mapping_in_memory.mapping_in_memory1.strand == kNegative) {
-    position1 =
-        paired_end_mapping_in_memory.mapping_in_memory1.ref_end_position;
-  }
-
-  if (paired_end_mapping_in_memory.mapping_in_memory2.strand == kNegative) {
-    position2 =
-        paired_end_mapping_in_memory.mapping_in_memory2.ref_end_position;
-  }
-
-  int rid1 = paired_end_mapping_in_memory.mapping_in_memory1.rid;
-  int rid2 = paired_end_mapping_in_memory.mapping_in_memory2.rid;
-  const int rid1_rank = pairs_custom_rid_rank_[rid1];
-  const int rid2_rank = pairs_custom_rid_rank_[rid2];
-
-  const bool is_rid1_rank_smaller =
-      rid1_rank < rid2_rank || (rid1 == rid2 && position1 < position2);
-  if (!is_rid1_rank_smaller) {
-    std::swap(rid1, rid2);
-    std::swap(position1, position2);
-    std::swap(strand1, strand2);
-  }
-
-  mappings_on_diff_ref_seqs[rid1].emplace_back(
-      paired_end_mapping_in_memory.GetReadId(),
-      std::string(paired_end_mapping_in_memory.mapping_in_memory1.read_name),
-      paired_end_mapping_in_memory.GetBarcode(), rid1, rid2, position1,
-      position2, strand1, strand2, paired_end_mapping_in_memory.mapq,
-      paired_end_mapping_in_memory.is_unique, /*num_dups=*/1);
 }
 
 template <>

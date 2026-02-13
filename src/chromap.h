@@ -229,6 +229,11 @@ void Chromap::MapSingleEndReads() {
                            custom_rid_rank_);
     reference.ReorderSequences(custom_rid_rank_);
   }
+  if (mapping_parameters_.mapping_output_format == MAPPINGFORMAT_PAIRS) {
+    GenerateCustomRidRanks(
+        mapping_parameters_.pairs_flipping_custom_rid_order_file_path,
+        num_reference_sequences, reference, pairs_custom_rid_rank_);
+  }
 
   Index index(mapping_parameters_.index_file_path);
   index.Load();
@@ -424,6 +429,13 @@ void Chromap::MapSingleEndReads() {
                       read_batch.GetSequenceLengthAt(read_index)) == -1) {
                 candidate_processor.GenerateCandidates(
                     mapping_parameters_.error_threshold, index,
+                    mapping_metadata);
+              }
+
+              // Apply stitched mode filter if enabled
+              if (mapping_parameters_.stitched_read_mode) {
+                candidate_processor.FilterDanglingCandidatesForSingleEnd(
+                    mapping_parameters_.dangling_threshold,
                     mapping_metadata);
               }
 
@@ -965,6 +977,19 @@ void Chromap::MapPairedEndReads() {
                   ++cache_miss;
                 }
                 size_t current_num_candidates2 = paired_end_mapping_metadata.mapping_metadata2_.GetNumCandidates();
+
+                // Apply stitched mode filter if enabled
+                if (mapping_parameters_.stitched_read_mode) {
+                  candidate_processor.FilterDanglingCandidatesForPairedEnd(
+                      mapping_parameters_.dangling_threshold,
+                      paired_end_mapping_metadata);
+
+                  // Update candidate counts after filtering
+                  current_num_candidates1 =
+                      paired_end_mapping_metadata.mapping_metadata1_.GetNumCandidates();
+                  current_num_candidates2 =
+                      paired_end_mapping_metadata.mapping_metadata2_.GetNumCandidates();
+                }
 
                 // increment variable for cache_hits
                 bool curr_read_hit_cache = false;

@@ -464,9 +464,9 @@ void DraftMappingGenerator::GenerateDraftMappingsOnOneStrand(
         }
       }
 
-      if (mapping_end_position + 1 - error_threshold_ - num_errors -
-              gap_beginning >=
-          mapping_length_threshold) {
+      int align_len = mapping_end_position + 1 - error_threshold_ - num_errors - gap_beginning;
+
+      if (align_len >= mapping_length_threshold) {
         actual_num_errors = num_errors;
         num_errors = -(mapping_end_position - error_threshold_ - num_errors -
                        gap_beginning);
@@ -481,6 +481,10 @@ void DraftMappingGenerator::GenerateDraftMappingsOnOneStrand(
                                       negative_read.data(), read_length);
           }
         }
+      } else if (stitched_read_mode_ && align_len >= 20) {
+        // Rescue partial alignment for stitched mode
+        actual_num_errors = num_errors;
+        num_errors = -align_len;  // Encode length as negative error
       } else {
         num_errors = error_threshold_ + 1;
         actual_num_errors = error_threshold_ + 1;
